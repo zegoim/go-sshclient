@@ -3,14 +3,19 @@ package sshclient
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
+	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/net/proxy"
 )
 
 type remoteScriptType byte
@@ -28,6 +33,20 @@ const (
 // A Client implements an SSH client that supports running commands and scripts remotely.
 type Client struct {
 	client *ssh.Client
+}
+
+type Response struct {
+	Code int32      `json:"code" yaml:"code"`
+	Message string  `json:"message" yaml:"message"`
+	Data *ProxyInfo `json:"data" yaml:"data"`
+
+}
+
+type ProxyInfo struct {
+	NeedProxy        	bool  	`json:"needProxy" yaml:"needProxy"`
+	AgentAddr        	string  `json:"agentAddr" yaml:"agentAddr"`
+	User           		string  `json:"user" yaml:"user"`
+	Password         	string  `json:"password" yaml:"password"`
 }
 
 // DialWithPasswd starts a client connection to the given SSH server with passwd authmethod.
@@ -92,13 +111,74 @@ func DialWithKeyWithPassphrase(addr, user, keyfile string, passphrase string) (*
 // Dial starts a client connection to the given SSH server.
 // This wraps ssh.Dial.
 func Dial(network, addr string, config *ssh.ClientConfig) (*Client, error) {
-	client, err := ssh.Dial(network, addr, config)
+	var client *ssh.Client
+	var err error
+	proxyInfo := getProxyInfo(addr)
+
+	if proxyInfo.NeedProxy {
+		client, err = proxySSHClient(network, addr, config, proxyInfo)
+	}else{
+		client, err = ssh.Dial(network, addr, config)
+	}
+
 	if err != nil {
 		return nil, err
 	}
 	return &Client{
 		client: client,
 	}, nil
+}
+
+
+func proxySSHClient(network, addr string, sshConfig *ssh.ClientConfig,proxyInfo *ProxyInfo) (*ssh.Client, error) {
+
+	auth := proxy.Auth{User: proxyInfo.User, Password: proxyInfo.Password}
+	dialer, err := proxy.SOCKS5(network, proxyInfo.AgentAddr, &auth, proxy.Direct)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := dialer.Dial(network, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	c, chans, reqs, err := ssh.NewClientConn(conn, addr, sshConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return ssh.NewClient(c, chans, reqs), nil
+}
+
+func getProxyInfo(addr string) *ProxyInfo {
+
+	//准备返回参数
+	var response = &Response{
+		Code: 1000,
+		Message: "ok",
+		Data: &ProxyInfo{},
+	}
+	addrList := strings.Split(addr,":")
+
+	// 初始化请求参数，超时时间：5秒
+	url := "http://cluster.devops.zego.cloud/api/v1/machine/proxy?wanIP=" + addrList[0]
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Add("Cookie", "base_token=2682bfd2e6844edbaadbf2e060691059")
+
+	//发起http请求
+	resp, err := client.Do(req)
+	if err != nil {
+		return response.Data
+	}
+	defer resp.Body.Close()
+
+	//反序列化代理信息
+	result, _ := ioutil.ReadAll(resp.Body)
+	_ = json.Unmarshal(result, response)
+
+	return response.Data
 }
 
 // Close closes the underlying client network connection.
